@@ -103,6 +103,26 @@ jobs:
           assert registration["name"] == "com.nestoptic.companion"
           assert registration["type"] == "stdio" and registration["allowed_origins"] == [origin]
           assert Path(registration["path"]) == bundle / "launch"
+          assert json.loads((bundle / "build-info.json").read_text())["browserSource"] == "installed-chrome"
+          assert not (bundle / "browsers").exists()
+
+          def track_chrome(host_pid, stop, found):
+              chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+              while not stop.wait(0.2):
+                  rows = subprocess.check_output(["/bin/ps", "-axo", "pid=,ppid=,comm="], text=True)
+                  processes = {}
+                  for row in rows.splitlines():
+                      parts = row.split(None, 2)
+                      if len(parts) == 3:
+                          processes[int(parts[0])] = (int(parts[1]), parts[2])
+                  for parent, executable in processes.values():
+                      if executable != chrome:
+                          continue
+                      while parent > 1 and parent in processes:
+                          if parent == host_pid:
+                              found.set()
+                              return
+                          parent = processes[parent][0]
 
           def read_exact(stream, size):
               data = stream.read(size)
@@ -150,6 +170,9 @@ jobs:
                   env = {"PATH": "/usr/bin:/bin", "HOME": os.environ["HOME"], "TMPDIR": folder}
                   host = subprocess.Popen([registration["path"], origin], env=env,
                                           stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+                  stop, chrome_seen = threading.Event(), threading.Event()
+                  monitor = threading.Thread(target=track_chrome, args=(host.pid, stop, chrome_seen), daemon=True)
+                  monitor.start()
                   try:
                       assert "website-video" in call(host, "hello", {})["capabilities"]
                       job = call(host, "start", {
@@ -162,6 +185,7 @@ jobs:
                           if event.get("event") == "job" and event["job"]["id"] == job["id"]:
                               job = event["job"]
                       assert job["state"] == "complete" and 0 < job["bytes"] <= 256 * 1024**2
+                      assert chrome_seen.is_set(), "Expected a system Chrome process descended from the native host"
                       video = work / "capture.mp4"
                       with video.open("wb") as output:
                           while output.tell() < job["bytes"]:
@@ -174,6 +198,8 @@ jobs:
                       host.stdin.close()
                       assert host.wait(timeout=20) == 0
                   finally:
+                      stop.set()
+                      monitor.join(timeout=3)
                       if host.poll() is None:
                           host.kill()
                           host.wait()
