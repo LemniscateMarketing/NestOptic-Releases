@@ -1,0 +1,21 @@
+name: Build Apple silicon media tools
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Build from pinned upstream sources and exercise the media pipeline
+        run: bash media/macos-arm64/build.sh "$RUNNER_TEMP/media-release"
+      - name: Retain unsigned tools and corresponding source
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: macOS-arm64-media
+          path: ${{ runner.temp }}/media-release/artifacts/
+          if-no-files-found: error
+          retention-days: 7
