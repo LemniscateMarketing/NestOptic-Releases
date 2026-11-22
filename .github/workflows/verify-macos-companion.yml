@@ -1,0 +1,207 @@
+name: Verify Mac companion installer
+on:
+  workflow_dispatch:
+    inputs:
+      asset_id:
+        description: Release asset ID for the approved package in this repository
+        required: true
+        type: string
+      version:
+        description: Approved companion version
+        required: true
+        type: string
+      sha256:
+        description: Approved SHA-256 of the stapled package
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  install-and-render:
+    runs-on: macos-26
+    timeout-minutes: 20
+    env:
+      ASSET_ID: ${{ inputs.asset_id }}
+      VERSION: ${{ inputs.version }}
+      EXPECTED_SHA: ${{ inputs.sha256 }}
+      HOST_REGISTRATION: /Library/Google/Chrome/NativeMessagingHosts/com.nestoptic.companion.json
+      COMPANION: /Library/Application Support/NestOptic Companion
+    steps:
+      - name: Download the exact release asset and verify Apple trust
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REPOSITORY" == "LemniscateMarketing/NestOptic-Releases" ]]
+          [[ "$(uname -m)" == arm64 && "$(sw_vers -productVersion | cut -d. -f1)" -ge 26 ]]
+          [[ "$ASSET_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$VERSION" != "0.1.0" ]]
+          [[ "$EXPECTED_SHA" =~ ^[a-f0-9]{64}$ ]]
+          [[ ! -e "$COMPANION" && ! -e "$HOST_REGISTRATION" ]]
+          if pkgutil --pkg-info com.nestoptic.companion >/dev/null 2>&1; then
+            echo "Expected a clean guest without a companion receipt." >&2
+            exit 1
+          fi
+          endpoint="repos/$GITHUB_REPOSITORY/releases/assets/$ASSET_ID"
+          gh api "$endpoint" > "$RUNNER_TEMP/companion-asset.json"
+          jq -e --arg name "NestOptic-Companion-macOS-arm64-$VERSION.pkg" \
+            --argjson id "$ASSET_ID" '.id == $id and .name == $name and .state == "uploaded"' \
+            "$RUNNER_TEMP/companion-asset.json" >/dev/null
+          pkg="$RUNNER_TEMP/NestOptic-Companion.pkg"
+          gh api -H 'Accept: application/octet-stream' "$endpoint" > "$pkg"
+          printf '%s  %s\n' "$EXPECTED_SHA" "$pkg" | shasum -a 256 --check
+          signature="$(LC_ALL=C /usr/sbin/pkgutil --check-signature "$pkg")"
+          grep -Eq '^[[:space:]]*1\. Developer ID Installer: Lemniscate Marketing Corp\. \(24WVYN57LK\)[[:space:]]*$' <<< "$signature"
+          /usr/bin/xcrun stapler validate "$pkg"
+          assessment="$(/usr/sbin/spctl --assess --type install --verbose=4 "$pkg" 2>&1)"
+          grep -Fxq 'source=Notarized Developer ID' <<< "$assessment"
+          echo "Verified the expected package, Developer ID Installer team, stapled ticket and Gatekeeper trust."
+
+      - name: Locate official Chrome and install the companion
+        shell: bash
+        run: |
+          set -euo pipefail
+          chrome='/Applications/Google Chrome.app'
+          if [[ ! -d "$chrome" ]]; then
+            chrome_pkg="$RUNNER_TEMP/google-chrome-stable.pkg"
+            curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+              'https://dl.google.com/chrome/mac/stable/GGRO/googlechrome.pkg' -o "$chrome_pkg"
+            signature="$(LC_ALL=C /usr/sbin/pkgutil --check-signature "$chrome_pkg")"
+            grep -Eq '^[[:space:]]*1\. Developer ID Installer: Google LLC \(EQHXZ8M8AV\)' <<< "$signature"
+            sudo /usr/sbin/installer -pkg "$chrome_pkg" -target /
+          fi
+          /usr/bin/codesign --verify -R='anchor apple generic and identifier "com.google.Chrome" and certificate leaf[subject.OU] = "EQHXZ8M8AV"' "$chrome"
+          [[ -x "$chrome/Contents/MacOS/Google Chrome" ]]
+          touch "$RUNNER_TEMP/nestoptic-install-started"
+          sudo /usr/sbin/installer -pkg "$RUNNER_TEMP/NestOptic-Companion.pkg" -target /
+          pkgutil --pkg-info com.nestoptic.companion | grep -Fxq "version: $VERSION"
+          echo "Installed companion $VERSION on $(sw_vers -productVersion) $(uname -m)."
+
+      - name: Render a local page through the installed native host
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 - <<'PY'
+          import base64
+          import functools
+          import http.server
+          import json
+          import os
+          from pathlib import Path
+          import signal
+          import struct
+          import subprocess
+          import tempfile
+          import threading
+
+          registration = json.loads(Path(os.environ["HOST_REGISTRATION"]).read_text())
+          bundle = Path(os.environ["COMPANION"])
+          origin = "chrome-extension://ccfbeoongieaplombblfedemilmpndla/"
+          assert registration["name"] == "com.nestoptic.companion"
+          assert registration["type"] == "stdio" and registration["allowed_origins"] == [origin]
+          assert Path(registration["path"]) == bundle / "launch"
+
+          def read_exact(stream, size):
+              data = stream.read(size)
+              if len(data) != size:
+                  raise RuntimeError("Installed native host disconnected early")
+              return data
+
+          def receive(host):
+              size, = struct.unpack("=I", read_exact(host.stdout, 4))
+              if not 0 < size <= 1024 * 1024:
+                  raise RuntimeError("Invalid message length")
+              return json.loads(read_exact(host.stdout, size))
+
+          def call(host, method, params):
+              request = json.dumps({"v": 1, "id": method, "method": method, "params": params}).encode()
+              host.stdin.write(struct.pack("=I", len(request)) + request)
+              host.stdin.flush()
+              while True:
+                  message = receive(host)
+                  if message.get("id") == method:
+                      if not message.get("ok"):
+                          raise RuntimeError("Installed host refused " + method)
+                      return message["result"]
+
+          class QuietHandler(http.server.SimpleHTTPRequestHandler):
+              def log_message(self, *args):
+                  pass
+
+          def timed_out(*_):
+              raise TimeoutError("Installed native host timed out")
+
+          signal.signal(signal.SIGALRM, timed_out)
+          signal.alarm(240)
+          with tempfile.TemporaryDirectory() as folder:
+              work = Path(folder)
+              (work / "index.html").write_text(
+                  '<!doctype html><title>Companion test</title><body style="margin:0">'
+                  + ''.join('<section style="height:950px;background:' + color
+                            + '">' + str(n) + '</section>'
+                            for n, color in enumerate(["#ffeeda", "#223355", "#77ddaa"]))
+                  + '</body>')
+              handler = functools.partial(QuietHandler, directory=folder)
+              with http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler) as server:
+                  threading.Thread(target=server.serve_forever, daemon=True).start()
+                  env = {"PATH": "/usr/bin:/bin", "HOME": os.environ["HOME"], "TMPDIR": folder}
+                  host = subprocess.Popen([registration["path"], origin], env=env,
+                                          stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+                  try:
+                      assert "website-video" in call(host, "hello", {})["capabilities"]
+                      job = call(host, "start", {
+                          "module": "website-video",
+                          "url": "http://127.0.0.1:" + str(server.server_port) + "/",
+                          "resolution": "1080p", "duration": 3, "fps": 30,
+                      })["job"]
+                      while job["state"] == "running":
+                          event = receive(host)
+                          if event.get("event") == "job" and event["job"]["id"] == job["id"]:
+                              job = event["job"]
+                      assert job["state"] == "complete" and 0 < job["bytes"] <= 256 * 1024**2
+                      video = work / "capture.mp4"
+                      with video.open("wb") as output:
+                          while output.tell() < job["bytes"]:
+                              chunk = call(host, "read", {"jobId": job["id"], "offset": output.tell()})
+                              data = base64.b64decode(chunk["data"], validate=True)
+                              assert data and len(data) <= job["bytes"] - output.tell()
+                              output.write(data)
+                              assert chunk["eof"] == (output.tell() == job["bytes"])
+                      call(host, "release", {"jobId": job["id"]})
+                      host.stdin.close()
+                      assert host.wait(timeout=20) == 0
+                  finally:
+                      if host.poll() is None:
+                          host.kill()
+                          host.wait()
+                      server.shutdown()
+                  probe = subprocess.check_output([
+                      str(bundle / "bin/ffprobe"), "-v", "error", "-count_frames", "-select_streams", "v:0",
+                      "-show_entries", "stream=codec_name,width,height,nb_read_frames", "-of", "json", str(video),
+                  ], env=env)
+                  stream, = json.loads(probe)["streams"]
+                  assert (stream["codec_name"], stream["width"], stream["height"], int(stream["nb_read_frames"])) == (
+                      "h264", 1920, 1080, 90)
+                  subprocess.run([str(bundle / "bin/ffmpeg"), "-v", "error", "-xerror", "-i", str(video),
+                                  "-f", "null", "-"], check=True, env=env)
+                  print("Verified Chrome registration, native messaging and a decoded 1920×1080 H.264 video with 90 frames.")
+          signal.alarm(0)
+          PY
+
+      - name: Remove the companion and confirm the clean state
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -f "$RUNNER_TEMP/nestoptic-install-started" ]]; then exit 0; fi
+          sudo rm -rf -- "$COMPANION"
+          sudo rm -f -- "$HOST_REGISTRATION"
+          if pkgutil --pkg-info com.nestoptic.companion >/dev/null 2>&1; then
+            sudo /usr/sbin/pkgutil --forget com.nestoptic.companion >/dev/null
+          fi
+          [[ ! -e "$COMPANION" && ! -e "$HOST_REGISTRATION" ]]
+          if pkgutil --pkg-info com.nestoptic.companion >/dev/null 2>&1; then exit 1; fi
+          echo "Verified removal of the companion, Chrome registration and receipt."
