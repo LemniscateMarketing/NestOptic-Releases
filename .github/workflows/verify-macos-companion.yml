@@ -32,6 +32,7 @@ jobs:
       - name: Download the exact release asset and verify Apple trust
         env:
           GH_TOKEN: ${{ github.token }}
+          DRAFT_ASSET_GRANT: ${{ secrets.NESTOPTIC_DRAFT_ASSET_GRANT }}
         shell: bash
         run: |
           set -euo pipefail
@@ -46,12 +47,54 @@ jobs:
             exit 1
           fi
           endpoint="repos/$GITHUB_REPOSITORY/releases/assets/$ASSET_ID"
-          gh api "$endpoint" > "$RUNNER_TEMP/companion-asset.json"
-          jq -e --arg name "NestOptic-Companion-macOS-arm64-$VERSION.pkg" \
-            --argjson id "$ASSET_ID" '.id == $id and .name == $name and .state == "uploaded"' \
-            "$RUNNER_TEMP/companion-asset.json" >/dev/null
           pkg="$RUNNER_TEMP/NestOptic-Companion.pkg"
-          gh api -H 'Accept: application/octet-stream' "$endpoint" > "$pkg"
+          if [[ -n "$DRAFT_ASSET_GRANT" ]]; then
+            # A read-only Actions token cannot see private drafts. The maintainer
+            # supplies a temporary encrypted grant for just this CDN object.
+            /usr/bin/python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from urllib.parse import urlsplit
+          from urllib.request import build_opener, HTTPRedirectHandler, Request
+
+          class DirectDownload(HTTPRedirectHandler):
+              def redirect_request(self, *args):
+                  return None
+
+          grant = json.loads(os.environ.pop("DRAFT_ASSET_GRANT"))
+          name = "NestOptic-Companion-macOS-arm64-" + os.environ["VERSION"] + ".pkg"
+          assert grant["repo"] == os.environ["GITHUB_REPOSITORY"]
+          assert str(grant["id"]) == os.environ["ASSET_ID"] and grant["name"] == name
+          assert grant["sha256"] == os.environ["EXPECTED_SHA"] and grant["size"] > 0
+          url = urlsplit(grant["url"])
+          assert url.scheme == "https" and url.netloc == "release-assets.githubusercontent.com"
+          target = Path(os.environ["RUNNER_TEMP"]) / "NestOptic-Companion.pkg"
+          try:
+              request = Request(grant["url"], headers={"Accept-Encoding": "identity"})
+              with build_opener(DirectDownload()).open(request, timeout=90) as data, target.open("xb") as output:
+                  if data.status != 200 or data.headers.get_filename() != name:
+                      raise ValueError("Unexpected asset")
+                  while True:
+                      block = data.read(1024 * 1024)
+                      if not block:
+                          break
+                      if output.tell() + len(block) > grant["size"]:
+                          raise ValueError("Unexpected size")
+                      output.write(block)
+                  if output.tell() != grant["size"]:
+                      raise ValueError("Incomplete download")
+          except Exception:
+              raise SystemExit("The temporary asset download or its metadata check failed.") from None
+          PY
+            unset DRAFT_ASSET_GRANT
+          else
+            gh api "$endpoint" > "$RUNNER_TEMP/companion-asset.json"
+            jq -e --arg name "NestOptic-Companion-macOS-arm64-$VERSION.pkg" \
+              --argjson id "$ASSET_ID" '.id == $id and .name == $name and .state == "uploaded"' \
+              "$RUNNER_TEMP/companion-asset.json" >/dev/null
+            gh api -H 'Accept: application/octet-stream' "$endpoint" > "$pkg"
+          fi
           printf '%s  %s\n' "$EXPECTED_SHA" "$pkg" | shasum -a 256 --check
           signature="$(LC_ALL=C /usr/sbin/pkgutil --check-signature "$pkg")"
           grep -Eq '^[[:space:]]*1\. Developer ID Installer: Lemniscate Marketing Corp\. \(24WVYN57LK\)[[:space:]]*$' <<< "$signature"
