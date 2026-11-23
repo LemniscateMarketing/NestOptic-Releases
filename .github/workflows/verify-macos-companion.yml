@@ -46,6 +46,9 @@ jobs:
             echo "Expected a clean guest without a companion receipt." >&2
             exit 1
           fi
+          asset_name="NestOptic-Helper-macOS-arm64-$VERSION.pkg"
+          if [[ "$VERSION" == "0.1.1" ]]; then asset_name="NestOptic-Companion-macOS-arm64-$VERSION.pkg"; fi
+          export EXPECTED_ASSET_NAME="$asset_name"
           endpoint="repos/$GITHUB_REPOSITORY/releases/assets/$ASSET_ID"
           pkg="$RUNNER_TEMP/NestOptic-Companion.pkg"
           if [[ -n "$DRAFT_ASSET_GRANT" ]]; then
@@ -63,7 +66,7 @@ jobs:
                   return None
 
           grant = json.loads(os.environ.pop("DRAFT_ASSET_GRANT"))
-          name = "NestOptic-Companion-macOS-arm64-" + os.environ["VERSION"] + ".pkg"
+          name = os.environ["EXPECTED_ASSET_NAME"]
           assert grant["repo"] == os.environ["GITHUB_REPOSITORY"]
           assert str(grant["id"]) == os.environ["ASSET_ID"] and grant["name"] == name
           assert grant["sha256"] == os.environ["EXPECTED_SHA"] and grant["size"] > 0
@@ -90,7 +93,7 @@ jobs:
             unset DRAFT_ASSET_GRANT
           else
             gh api "$endpoint" > "$RUNNER_TEMP/companion-asset.json"
-            jq -e --arg name "NestOptic-Companion-macOS-arm64-$VERSION.pkg" \
+            jq -e --arg name "$EXPECTED_ASSET_NAME" \
               --argjson id "$ASSET_ID" '.id == $id and .name == $name and .state == "uploaded"' \
               "$RUNNER_TEMP/companion-asset.json" >/dev/null
             gh api -H 'Accept: application/octet-stream' "$endpoint" > "$pkg"
